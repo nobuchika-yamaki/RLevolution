@@ -1,0 +1,221 @@
+import numpy as np
+from scipy.ndimage import gaussian_filter
+
+# =========================
+# Global settings (Methods)
+# =========================
+GRID_SIZE = 20
+SIGMA_BG = 1.0
+ANOMALY_OFFSET_RANGE = (1.5, 2.0)
+ANOMALY_SIZE = 3
+
+N_TRIALS_FITNESS = 8
+N_TRIALS_EVAL = 20
+
+POP_SIZE = 20
+ELITE_FRAC = 0.5
+SIGMA_MUT = 0.05
+
+A_MIN = 0.1
+EPS = 1e-6
+RT_MAX = 1e5
+
+# =========================
+# Task environment
+# =========================
+def generate_environment(rng):
+    x = rng.normal(0, 1, size=(GRID_SIZE, GRID_SIZE))
+    bg = gaussian_filter(x, sigma=SIGMA_BG, mode="reflect")
+
+    cx = rng.integers(1, GRID_SIZE - 2)
+    cy = rng.integers(1, GRID_SIZE - 2)
+    offset = rng.uniform(*ANOMALY_OFFSET_RANGE)
+
+    bg[cx-1:cx+2, cy-1:cy+2] += offset
+    return bg
+
+# =========================
+# Gaussian integration
+# =========================
+def gaussian_kernel(a):
+    r = int(np.ceil(3 * a))
+    xs = np.arange(-r, r + 1)
+    ys = np.arange(-r, r + 1)
+    X, Y = np.meshgrid(xs, ys)
+    G = np.exp(-(X**2 + Y**2) / (2 * a**2))
+    G /= G.sum()
+    return G
+
+def integrate(x, a):
+    return gaussian_filter(x, sigma=a, mode="reflect")
+
+# =========================
+# Single trial evaluation
+# =========================
+def evaluate_trial(agent, rng, delta):
+    a_L, a_R, lam = agent
+
+    m_L = 1.0 - delta / 2
+    m_R = 1.0 + delta / 2
+
+    env = generate_environment(rng)
+
+    xhat_L = integrate(env, a_L)
+    xhat_R = integrate(env, a_R)
+
+    M_L = np.sum(np.abs(env - xhat_L))
+    M_R = np.sum(np.abs(env - xhat_R))
+
+    D = (m_R * M_R - m_L * M_L) + lam
+    RT = 1.0 / (abs(D) + EPS)
+
+    if RT > RT_MAX:
+        RT = RT_MAX
+
+    return RT
+
+# =========================
+# Fitness evaluation
+# =========================
+def evaluate_fitness(agent, rng, delta):
+    RTs = [evaluate_trial(agent, rng, delta) for _ in range(N_TRIALS_FITNESS)]
+    return -np.mean(RTs)
+
+# =========================
+# Evolutionary operators
+# =========================
+def initialize_population():
+    pop = np.zeros((POP_SIZE, 3))
+    pop[:, 0] = 1.0  # a_L
+    pop[:, 1] = 1.0  # a_R
+    pop[:, 2] = 0.0  # lambda
+    return pop
+
+def mutate(agent, rng):
+    a_L, a_R, lam = agent
+    a_L += rng.normal(0, SIGMA_MUT)
+    a_R += rng.normal(0, SIGMA_MUT)
+    lam += rng.normal(0, SIGMA_MUT)
+
+    a_L = max(a_L, A_MIN)
+    a_R = max(a_R, A_MIN)
+
+    return np.array([a_L, a_R, lam])
+
+def reproduce(parents, rng):
+    offspring = []
+    while len(offspring) < POP_SIZE:
+        p1, p2 = rng.choice(len(parents), size=2, replace=False)
+        child = 0.5 * (parents[p1] + parents[p2])
+        child = mutate(child, rng)
+        offspring.append(child)
+    return np.array(offspring)
+
+# =========================
+# Run one lineage
+# =========================
+def run_lineage(seed, generations, delta):
+    rng = np.random.default_rng(seed)
+    pop = initialize_population()
+
+    for _ in range(generations):
+        fitness = np.array([evaluate_fitness(agent, rng, delta) for agent in pop])
+        elite_n = int(POP_SIZE * ELITE_FRAC)
+        elites = pop[np.argsort(fitness)[-elite_n:]]
+        pop = reproduce(elites, rng)
+
+    # final evaluation
+    eval_rng = np.random.default_rng(seed + 9999)
+    RTs = []
+    for agent in pop:
+        rts = [evaluate_trial(agent, eval_rng, delta) for _ in range(N_TRIALS_EVAL)]
+        RTs.append(np.mean(rts))
+
+    best_idx = np.argmin(RTs)
+    best = pop[best_idx]
+
+    a_L, a_R, lam = best
+    Delta = a_R - a_L
+
+    return {
+        "a_L": a_L,
+        "a_R": a_R,
+        "lambda": lam,
+        "Delta": Delta,
+        "abs_Delta": abs(Delta),
+        "meanRT_final20": RTs[best_idx]
+    }
+
+# =========================
+# Stage runners
+# =========================
+def run_stage(stage_name, n_lineages, generations, delta, seed_offset=0):
+    results = []
+    for i in range(n_lineages):
+        res = run_lineage(seed_offset + i, generations, delta)
+        res["lineage"] = i
+        res["stage"] = stage_name
+        results.append(res)
+    return results
+
+# =========================
+# Example executions
+# =========================
+
+# Stage 1
+stage1 = run_stage(
+    stage_name="Stage1",
+    n_lineages=40,
+    generations=50,
+    delta=0.0
+)
+
+# Stage 2
+stage2 = run_stage(
+    stage_name="Stage2",
+    n_lineages=20,
+    generations=50,
+    delta=0.02
+)
+
+# Stage 2R
+stage2R = run_stage(
+    stage_name="Stage2R",
+    n_lineages=20,
+    generations=50,
+    delta=-0.02
+)
+
+# Stage 3 (reseeding)
+stage3 = []
+for i, r in enumerate(stage2):
+    rng = np.random.default_rng(10_000 + i)
+    seed_agent = np.array([r["a_L"], r["a_R"], r["lambda"]])
+
+    pop = np.array([mutate(seed_agent, rng) for _ in range(POP_SIZE)])
+
+    for _ in range(30):
+        fitness = np.array([evaluate_fitness(agent, rng, delta=0.0) for agent in pop])
+        elite_n = int(POP_SIZE * ELITE_FRAC)
+        elites = pop[np.argsort(fitness)[-elite_n:]]
+        pop = reproduce(elites, rng)
+
+    eval_rng = np.random.default_rng(20_000 + i)
+    RTs = []
+    for agent in pop:
+        rts = [evaluate_trial(agent, eval_rng, delta=0.0) for _ in range(N_TRIALS_EVAL)]
+        RTs.append(np.mean(rts))
+
+    best = pop[np.argmin(RTs)]
+    a_L, a_R, lam = best
+
+    stage3.append({
+        "lineage": i,
+        "stage": "Stage3",
+        "a_L": a_L,
+        "a_R": a_R,
+        "lambda": lam,
+        "Delta": a_R - a_L,
+        "abs_Delta": abs(a_R - a_L),
+        "meanRT_final20": min(RTs)
+    })
